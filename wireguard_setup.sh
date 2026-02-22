@@ -1,115 +1,70 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/bash
 
-# Simple WireGuard server + single client setup
-# Tested conceptually for Ubuntu/Debian-like systems.
+PORT=51820
+SERVER_IP="187.102.244.102"
+SUBNET="10.0.0"
 
-WG_IFACE="wg0"
-WG_PORT="${WG_PORT:-51820}"
-WG_NET="10.8.0.0/24"
-WG_SERVER_IP="10.8.0.1"
-WG_CLIENT_IP="10.8.0.2"
-WG_DIR="/etc/wireguard"
-SERVER_PRIV_KEY_FILE="${WG_DIR}/server_private.key"
-SERVER_PUB_KEY_FILE="${WG_DIR}/server_public.key"
-CLIENT_PRIV_KEY_FILE="${WG_DIR}/client_private.key"
-CLIENT_PUB_KEY_FILE="${WG_DIR}/client_public.key"
-CLIENT_CONF_FILE="${WG_DIR}/client.conf"
+SERVER_PRIVATE_KEY=$(cat /etc/wireguard/server_private.key)
+SERVER_PUBLIC_KEY=$(echo "$SERVER_PRIVATE_KEY" | wg pubkey)
 
-# Detect the main outgoing interface (best-effort)
-detect_main_iface() {
-  local dev
-  if dev=$(ip route get 1.1.1.1 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1); exit}'); then
-    echo "$dev"
-  else
-    echo "eth0"
-  fi
-}
+CLIENT1_PRIVATE=$(wg genkey)
+CLIENT1_PUBLIC=$(echo "$CLIENT1_PRIVATE" | wg pubkey)
+CLIENT2_PRIVATE=$(wg genkey)
+CLIENT2_PUBLIC=$(echo "$CLIENT2_PRIVATE" | wg pubkey)
 
-main_iface=$(detect_main_iface)
+# Write server config
+{
+  echo "[Interface]"
+  echo "Address = ${SUBNET}.1/24"
+  echo "ListenPort = ${PORT}"
+  echo "PrivateKey = ${SERVER_PRIVATE_KEY}"
+  echo "PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE"
+  echo "PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE"
+  echo ""
+  echo "[Peer]"
+  echo "# Client 1"
+  echo "PublicKey = ${CLIENT1_PUBLIC}"
+  echo "AllowedIPs = ${SUBNET}.2/32"
+  echo ""
+  echo "[Peer]"
+  echo "# Client 2"
+  echo "PublicKey = ${CLIENT2_PUBLIC}"
+  echo "AllowedIPs = ${SUBNET}.3/32"
+} | sudo tee /etc/wireguard/wg0.conf > /dev/null
 
-if [[ $EUID -ne 0 ]]; then
-  echo "Please run as root (sudo)." >&2
-  exit 1
-fi
-
-echo "=== Updating packages and installing WireGuard ==="
-apt-get update -y
-apt-get install -y wireguard iproute2 iptables
-
-mkdir -p "${WG_DIR}"
-chmod 700 "${WG_DIR}"
-
-echo "=== Generating server keys ==="
-umask 077
-wg genkey | tee "${SERVER_PRIV_KEY_FILE}" | wg pubkey > "${SERVER_PUB_KEY_FILE}"
-
-echo "=== Generating client keys ==="
-wg genkey | tee "${CLIENT_PRIV_KEY_FILE}" | wg pubkey > "${CLIENT_PUB_KEY_FILE}"
-
-SERVER_PRIV_KEY=$(cat "${SERVER_PRIV_KEY_FILE}")
-SERVER_PUB_KEY=$(cat "${SERVER_PUB_KEY_FILE}")
-CLIENT_PRIV_KEY=$(cat "${CLIENT_PRIV_KEY_FILE}")
-CLIENT_PUB_KEY=$(cat "${CLIENT_PUB_KEY_FILE}")
-
-# Get public IP (basic method)
-PUBLIC_IP=$(curl -4s https://ifconfig.co || curl -4s https://ipv4.icanhazip.com || echo "YOUR_SERVER_IP")
-
-echo "=== Enabling IP forwarding ==="
-sysctl -w net.ipv4.ip_forward=1 >/dev/null
-if ! grep -q "net.ipv4.ip_forward" /etc/sysctl.conf 2>/dev/null; then
-  echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
-else
-  sed -i 's/^net\.ipv4\.ip_forward.*/net.ipv4.ip_forward = 1/' /etc/sysctl.conf
-fi
-
-echo "=== Writing server config to ${WG_DIR}/${WG_IFACE}.conf ==="
-cat > "${WG_DIR}/${WG_IFACE}.conf" <<EOF
-[Interface]
-Address = ${WG_SERVER_IP}/24
-ListenPort = ${WG_PORT}
-PrivateKey = ${SERVER_PRIV_KEY}
-
-# NAT VPN subnet out via main interface
-PostUp = iptables -t nat -A POSTROUTING -s ${WG_NET} -o ${main_iface} -j MASQUERADE
-PostDown = iptables -t nat -D POSTROUTING -s ${WG_NET} -o ${main_iface} -j MASQUERADE
-
-[Peer]
-# Client peer
-PublicKey = ${CLIENT_PUB_KEY}
-AllowedIPs = ${WG_CLIENT_IP}/32
-EOF
-
-chmod 600 "${WG_DIR}/${WG_IFACE}.conf"
-
-echo "=== Starting and enabling WireGuard (${WG_IFACE}) ==="
-systemctl enable "wg-quick@${WG_IFACE}"
-systemctl restart "wg-quick@${WG_IFACE}"
-
-echo "=== Creating client config at ${CLIENT_CONF_FILE} ==="
-cat > "${CLIENT_CONF_FILE}" <<EOF
-[Interface]
-PrivateKey = ${CLIENT_PRIV_KEY}
-Address = ${WG_CLIENT_IP}/32
-DNS = 1.1.1.1
-
-[Peer]
-PublicKey = ${SERVER_PUB_KEY}
-Endpoint = ${PUBLIC_IP}:${WG_PORT}
-AllowedIPs = 0.0.0.0/0, ::/0
-PersistentKeepalive = 25
-EOF
-
-chmod 600 "${CLIENT_CONF_FILE}"
-
-echo
-echo "=== DONE ==="
-echo "Server interface: ${WG_IFACE}"
-echo "Public IP (guessed): ${PUBLIC_IP}"
-echo
-echo "Client config written to: ${CLIENT_CONF_FILE}"
-echo "You can display it with:"
-echo "  sudo cat ${CLIENT_CONF_FILE}"
-echo
-echo "Import this config into your WireGuard client app."
-echo
+echo "==============================="
+echo "SERVER CONFIG written to /etc/wireguard/wg0.conf"
+echo "Server Public Key: ${SERVER_PUBLIC_KEY}"
+echo "==============================="
+echo ""
+echo "==============================="
+echo "CLIENT 1 CONFIG (use on client 1):"
+echo "==============================="
+echo "[Interface]"
+echo "Address = ${SUBNET}.2/24"
+echo "PrivateKey = ${CLIENT1_PRIVATE}"
+echo "DNS = 1.1.1.1"
+echo ""
+echo "[Peer]"
+echo "PublicKey = ${SERVER_PUBLIC_KEY}"
+echo "Endpoint = ${SERVER_IP}:${PORT}"
+echo "AllowedIPs = 0.0.0.0/0"
+echo "PersistentKeepalive = 25"
+echo ""
+echo "==============================="
+echo "CLIENT 2 CONFIG (use on client 2):"
+echo "==============================="
+echo "[Interface]"
+echo "Address = ${SUBNET}.3/24"
+echo "PrivateKey = ${CLIENT2_PRIVATE}"
+echo "DNS = 1.1.1.1"
+echo ""
+echo "[Peer]"
+echo "PublicKey = ${SERVER_PUBLIC_KEY}"
+echo "Endpoint = ${SERVER_IP}:${PORT}"
+echo "AllowedIPs = 0.0.0.0/0"
+echo "PersistentKeepalive = 25"
+echo ""
+echo "==============================="
+echo "Done! Now run: sudo systemctl restart wg-quick@wg0"
+echo "==============================="
